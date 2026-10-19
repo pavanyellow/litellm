@@ -2042,7 +2042,7 @@ def test_a_timed_out_request_is_priced_at_the_rate_the_router_registered_for_the
         request_body={},
         dispatched=True,
         provider_billed=True,
-        litellm_params={"model": f"openai/{FAILURE_USAGE_MODEL}", "metadata": {"model_info": {"id": "dep-lit145"}}},
+        deployment_id="dep-lit145",
     )
 
     assert lifted is not None
@@ -2079,6 +2079,7 @@ def test_every_earlier_timed_out_attempt_is_billed_at_its_own_deployment_rate(mo
             }
         },
         estimated_usage=usage,
+        base_model=None,
     )
 
     assert [(a.attempted_retries, a.deployment_id) for a in attempts] == [(0, "dep-lit145-a"), (2, "dep-lit145-b")]
@@ -2088,33 +2089,69 @@ def test_every_earlier_timed_out_attempt_is_billed_at_its_own_deployment_rate(mo
     assert all(a.usage is usage for a in attempts)
 
 
-def test_the_deployment_id_is_resolved_like_the_success_path_litellm_metadata_first(monkeypatch):
-    """On /messages and /responses the router stamps the real deployment id into litellm_metadata;
-    a model_info on metadata (possibly client-supplied) must not pick the rate."""
-    from litellm.proxy.utils import _failure_usage_to_lift
+def _dispatched_failure_logging_obj(model: str, litellm_params: dict) -> object:
+    """A Logging object as the failure hook sees it: litellm_params in the real get_litellm_params()
+    shape (every key present, ``litellm_metadata`` None on chat completions) and a first-handoff
+    instant, so the lift treats the request as dispatched."""
+    from litellm.litellm_core_utils.litellm_logging import Logging
 
-    for dep, rate in (("dep-lit145-real", 0.25), ("dep-lit145-wrong", 9.0)):
-        monkeypatch.setitem(
-            litellm.model_cost,
-            dep,
-            {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": rate, "output_cost_per_token": rate},
-        )
-
-    lifted = _failure_usage_to_lift(
-        model_call_details={"call_type": "acompletion", "model": FAILURE_USAGE_MODEL, "messages": ONE_USER_MESSAGE},
-        request_body={},
-        dispatched=True,
-        provider_billed=True,
-        litellm_params={
-            "model": f"openai/{FAILURE_USAGE_MODEL}",
-            "metadata": {"model_info": {"id": "dep-lit145-wrong"}},
-            "litellm_metadata": {"model_info": {"id": "dep-lit145-real"}},
-        },
+    logging_obj = Logging(
+        model=model,
+        messages=ONE_USER_MESSAGE,
+        stream=False,
+        call_type="acompletion",
+        start_time=real_datetime.datetime.now(),
+        litellm_call_id="call-lit145",
+        function_id="fn-lit145",
     )
+    logging_obj.update_environment_variables(model=model, user="", optional_params={}, litellm_params=litellm_params)
+    logging_obj.model_call_details["first_api_call_start_time"] = real_datetime.datetime.now()
+    logging_obj.model_call_details["messages"] = ONE_USER_MESSAGE
+    logging_obj.model_call_details["call_type"] = "acompletion"
+    return logging_obj
 
-    assert lifted is not None
-    usage, response_cost = lifted
-    assert response_cost == pytest.approx(usage.prompt_tokens * 0.25)
+
+def test_the_deployment_rate_is_found_on_the_logging_objects_real_litellm_params(monkeypatch):
+    """``get_litellm_params()`` always carries a ``litellm_metadata`` key (None on chat
+    completions) next to the router-stamped ``metadata.model_info.id``; the failure row must
+    still price at the deployment's own rate, like ``Logging.get_router_model_id`` on the
+    success path."""
+    from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
+    from litellm.proxy.utils import _failure_fields_to_lift
+
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "dep-lit145-real-shape",
+        {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 0.25, "output_cost_per_token": 0.25},
+    )
+    litellm_params = get_litellm_params(metadata={"model_info": {"id": "dep-lit145-real-shape"}})
+    assert "litellm_metadata" in litellm_params and litellm_params["litellm_metadata"] is None
+    logging_obj = _dispatched_failure_logging_obj(FAILURE_USAGE_MODEL, litellm_params)
+
+    lifted = _failure_fields_to_lift({"litellm_logging_obj": logging_obj}, provider_billed=True)
+
+    assert lifted["response_cost"] == pytest.approx(lifted["combined_usage_object"].prompt_tokens * 0.25)
+
+
+def test_an_azure_deployment_is_priced_at_its_base_model_like_the_success_path():
+    """An Azure deployment name is not in the cost map; the success path prices it through
+    ``model_info.base_model`` (``get_base_model_from_metadata``) and so must the failure row."""
+    from litellm.litellm_core_utils.get_litellm_params import get_litellm_params
+    from litellm.proxy.utils import _failure_fields_to_lift
+
+    logging_obj = _dispatched_failure_logging_obj(
+        "azure/lit145-not-in-cost-map",
+        get_litellm_params(metadata={"model_info": {"base_model": "azure/gpt-4.1"}}),
+    )
+    logging_obj.model_call_details["custom_llm_provider"] = "azure"
+
+    lifted = _failure_fields_to_lift({"litellm_logging_obj": logging_obj}, provider_billed=True)
+
+    expected_cost, _ = litellm.cost_per_token(
+        model="azure/gpt-4.1", prompt_tokens=lifted["combined_usage_object"].prompt_tokens
+    )
+    assert expected_cost > 0
+    assert lifted["response_cost"] == pytest.approx(expected_cost)
 
 
 def test_a_litellm_params_key_in_the_request_body_cannot_zero_the_timeout_price():
@@ -2133,7 +2170,7 @@ def test_a_litellm_params_key_in_the_request_body_cannot_zero_the_timeout_price(
         request_body={},
         dispatched=True,
         provider_billed=True,
-        litellm_params={"model": f"openai/{FAILURE_USAGE_MODEL}"},
+        deployment_id=None,
     )
 
     assert lifted is not None
