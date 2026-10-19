@@ -267,6 +267,7 @@ from litellm.repositories.verification_token_repository import (
     VerificationTokenRepository,
 )
 from litellm.router_utils.common_utils import resolve_model_group_alias
+from litellm.router_utils.fallback_event_handlers import routed_deployment_id
 from litellm.secret_managers.main import str_to_bool
 from litellm.types.integrations.slack_alerting import DEFAULT_ALERT_TYPES
 from litellm.types.llms.openai import ResponsesAPIResponse
@@ -1061,28 +1062,10 @@ def _failure_usage_to_lift(
     if not provider_billed:
         return estimated_usage, 0.0
     return estimated_usage, _estimated_input_cost(
-        model_call_details, estimated_usage.prompt_tokens, _router_deployment_id(litellm_params)
+        model_call_details,
+        estimated_usage.prompt_tokens,
+        routed_deployment_id(litellm_params) if litellm_params is not None else None,
     )
-
-
-def _router_deployment_id(litellm_params: Mapping[str, object] | None) -> object:
-    """The deployment id the router stamped on the request, resolved the way the success path's
-    ``Logging.get_router_model_id`` does: ``litellm_metadata`` before ``metadata`` (the router writes
-    the real id into ``litellm_metadata`` on /messages and /responses), and only a ``model_info``
-    that carries an ``id`` counts, so a client-supplied ``metadata.model_info`` cannot win."""
-    if litellm_params is None:
-        return None
-    for metadata_key in ("litellm_metadata", "metadata"):
-        metadata = litellm_params.get(metadata_key)
-        if not isinstance(metadata, dict):
-            continue
-        model_info = cast("Mapping[str, object]", metadata).get("model_info")  # cast-ok: untyped router dict
-        if not isinstance(model_info, dict):
-            continue
-        model_id = cast("Mapping[str, object]", model_info).get("id")  # cast-ok: untyped router dict
-        if model_id is not None:
-            return model_id
-    return None
 
 
 @dataclass(frozen=True)
@@ -1162,10 +1145,11 @@ def _billed_earlier_attempts(
 
 
 def _deployment_cost_per_token(deployment_id: object, model: str) -> CostPerToken | None:
-    """The pricing the router registered for this deployment under its ``model_info.id``, read
-    through ``deployment_pricing_model_info`` exactly as the success path does; None means the
-    public cost map. The id comes from ``Logging.litellm_params`` (deployment config), never from
-    the flattened ``model_call_details`` copy that a request body key can overwrite."""
+    """The pricing the router registered for this deployment under its ``model_info.id``: the final
+    attempt's id is read with the router's own ``routed_deployment_id`` from ``Logging.litellm_params``
+    (never from the flattened ``model_call_details`` copy a request body key can overwrite), an
+    earlier attempt's from its retry record, and priced through ``deployment_pricing_model_info`` as
+    the success path does; None means the cost map."""
     model_info: Final = deployment_pricing_model_info(
         model_id=str(deployment_id) if deployment_id is not None else None, deployment_model=model
     )
