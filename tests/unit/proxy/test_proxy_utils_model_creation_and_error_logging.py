@@ -2051,6 +2051,40 @@ def test_a_timed_out_request_is_priced_at_the_rate_the_router_registered_for_the
     assert response_cost == pytest.approx(usage.prompt_tokens * 0.25)
 
 
+def test_every_earlier_timed_out_attempt_is_billed_at_its_own_deployment_rate(monkeypatch):
+    """The router leaves one RetryAttemptRecord per failed attempt in metadata.previous_models; the
+    Timeout ones are billed (each at the deployment that served it), a 429 attempt is not."""
+    from litellm.proxy.utils import _billed_earlier_attempts
+
+    monkeypatch.setitem(
+        litellm.model_cost,
+        "dep-lit145-b",
+        {"litellm_provider": "openai", "mode": "chat", "input_cost_per_token": 0.25, "output_cost_per_token": 1.0},
+    )
+    usage = litellm.Usage(prompt_tokens=24, completion_tokens=0, total_tokens=24)
+    public_rate, _ = litellm.cost_per_token(model=FAILURE_USAGE_MODEL, prompt_tokens=24)
+
+    attempts = _billed_earlier_attempts(
+        model_call_details={"model": FAILURE_USAGE_MODEL, "custom_llm_provider": "openai"},
+        litellm_params={
+            "metadata": {
+                "previous_models": (
+                    {"deployment_id": "dep-lit145-a", "exception_type": "Timeout", "attempted_retries": 0},
+                    {"deployment_id": "dep-lit145-b", "exception_type": "RateLimitError", "attempted_retries": 1},
+                    {"deployment_id": "dep-lit145-b", "exception_type": "Timeout", "attempted_retries": 2},
+                )
+            }
+        },
+        estimated_usage=usage,
+    )
+
+    assert [(a.attempted_retries, a.deployment_id) for a in attempts] == [(0, "dep-lit145-a"), (2, "dep-lit145-b")]
+    assert attempts[0].response_cost == pytest.approx(public_rate)
+    assert attempts[0].response_cost > 0
+    assert attempts[1].response_cost == pytest.approx(24 * 0.25)
+    assert all(a.usage is usage for a in attempts)
+
+
 def test_a_litellm_params_key_in_the_request_body_cannot_zero_the_timeout_price():
     """``model_call_details`` is flattened with the request's optional_params, so a body key
     named ``litellm_params`` can land there; the deployment rate must come from the logging

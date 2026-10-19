@@ -1064,17 +1064,72 @@ def _failure_usage_to_lift(
         return None
     if not provider_billed:
         return estimated_usage, 0.0
-    return estimated_usage, _estimated_input_cost(model_call_details, estimated_usage.prompt_tokens, litellm_params)
+    return estimated_usage, _estimated_input_cost(
+        model_call_details, estimated_usage.prompt_tokens, deployment_model_info(litellm_params).get("id")
+    )
 
 
-def _deployment_cost_per_token(litellm_params: Mapping[str, object] | None, model: str) -> CostPerToken | None:
+@dataclass(frozen=True)
+class BilledFailedAttempt:
+    """An earlier retry attempt the provider also billed, written as its own spend row."""
+
+    attempted_retries: int
+    deployment_id: str | None
+    usage: Usage
+    response_cost: float
+
+
+def _retry_attempt_records(litellm_params: Mapping[str, object] | None) -> tuple[Mapping[str, object], ...]:
+    """The router's ``RetryAttemptRecord`` breadcrumbs, one per failed attempt before the final one."""
+    if litellm_params is None:
+        return ()
+    for metadata_key in ("metadata", "litellm_metadata"):
+        metadata = litellm_params.get(metadata_key)
+        if not isinstance(metadata, dict):
+            continue
+        records = cast("Mapping[str, object]", metadata).get("previous_models")  # cast-ok: untyped router dict
+        if isinstance(records, (list, tuple)):
+            return tuple(
+                cast("Mapping[str, object]", record)  # cast-ok: RetryAttemptRecord TypedDict, read with .get
+                for record in cast("Sequence[object]", records)  # cast-ok: untyped router tuple
+                if isinstance(record, dict)
+            )
+    return ()
+
+
+def _billed_earlier_attempts(
+    model_call_details: Mapping[str, object],
+    litellm_params: Mapping[str, object] | None,
+    estimated_usage: Usage,
+) -> tuple[BilledFailedAttempt, ...]:
+    """Every earlier retry attempt the provider also billed. The router records one
+    ``RetryAttemptRecord`` per failed attempt in ``metadata.previous_models``; an attempt that
+    ended in a ``Timeout`` had the same prompt accepted by its deployment, so it is billed like
+    the final attempt, at that deployment's input rate. Only the exception class survives on the
+    record, so an earlier connect timeout is billed too; any other failure class is not."""
+    return tuple(
+        BilledFailedAttempt(
+            attempted_retries=(
+                record["attempted_retries"] if isinstance(record.get("attempted_retries"), int) else index
+            ),
+            deployment_id=str(record["deployment_id"]) if record.get("deployment_id") is not None else None,
+            usage=estimated_usage,
+            response_cost=_estimated_input_cost(
+                model_call_details, estimated_usage.prompt_tokens, record.get("deployment_id")
+            ),
+        )
+        for index, record in enumerate(_retry_attempt_records(litellm_params))
+        if record.get("exception_type") == litellm.Timeout.__name__
+    )
+
+
+def _deployment_cost_per_token(deployment_id: object, model: str) -> CostPerToken | None:
     """The pricing the router registered for this deployment under its ``model_info.id``, read
     through ``deployment_pricing_model_info`` exactly as the success path does; None means the
     public cost map. The id comes from ``Logging.litellm_params`` (deployment config), never from
     the flattened ``model_call_details`` copy that a request body key can overwrite."""
-    model_id: Final = deployment_model_info(litellm_params).get("id")
     model_info: Final = deployment_pricing_model_info(
-        model_id=str(model_id) if model_id is not None else None, deployment_model=model
+        model_id=str(deployment_id) if deployment_id is not None else None, deployment_model=model
     )
     if model_info is None:
         return None
@@ -1087,7 +1142,7 @@ def _deployment_cost_per_token(litellm_params: Mapping[str, object] | None, mode
 def _estimated_input_cost(
     model_call_details: Mapping[str, object],
     prompt_tokens: int,
-    litellm_params: Mapping[str, object] | None,
+    deployment_id: object,
 ) -> float:
     """Input price for the estimated prompt; an unpriceable model (not in the cost map and no
     deployment rate) keeps the row at $0 rather than dropping the failure row."""
@@ -1097,7 +1152,7 @@ def _estimated_input_cost(
             model=model,
             custom_llm_provider=str(model_call_details.get("custom_llm_provider") or "") or None,
             prompt_tokens=prompt_tokens,
-            custom_cost_per_token=_deployment_cost_per_token(litellm_params, model),
+            custom_cost_per_token=_deployment_cost_per_token(deployment_id, model),
         )
     except Exception as exc:  # noqa: BLE001  # cost_per_token raises BadRequestError for an unmapped model and the row must still be written
         verbose_proxy_logger.debug(
@@ -1261,12 +1316,18 @@ def _failure_fields_to_lift(request_data: Mapping[str, object], provider_billed:
         return _EMPTY_LIFT
     _model_call_details: Final = getattr(_logging_obj, "model_call_details", {})
     _first_handoff: Final = _model_call_details.get("first_api_call_start_time")
+    _litellm_params: Final = getattr(_logging_obj, "litellm_params", None)
     _usage_to_lift: Final = _failure_usage_to_lift(
         model_call_details=_model_call_details,
         request_body=request_data,
         dispatched=_first_handoff is not None,
         provider_billed=provider_billed,
-        litellm_params=getattr(_logging_obj, "litellm_params", None),
+        litellm_params=_litellm_params,
+    )
+    _earlier_attempts: Final = (
+        _billed_earlier_attempts(_model_call_details, _litellm_params, _usage_to_lift[0])
+        if provider_billed and _usage_to_lift is not None and isinstance(_usage_to_lift[0], Usage)
+        else ()
     )
     _entries: Final = (
         ("start_time", _model_call_details.get("start_time")),
@@ -1275,6 +1336,7 @@ def _failure_fields_to_lift(request_data: Mapping[str, object], provider_billed:
         ("combined_usage_object", None if _usage_to_lift is None else _usage_to_lift[0]),
         ("response_cost", None if _usage_to_lift is None else (_usage_to_lift[1] or 0.0)),
         ("standard_logging_object", _model_call_details.get("standard_logging_object")),
+        ("billed_failed_attempts", _earlier_attempts or None),
     )
     return MappingProxyType({key: value for key, value in _entries if value is not None})
 
