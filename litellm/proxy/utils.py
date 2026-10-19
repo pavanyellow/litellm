@@ -1079,6 +1079,17 @@ class BilledFailedAttempt:
     response_cost: float
 
 
+def _retry_metadata_bucket(litellm_params: Mapping[str, object] | None) -> Mapping[str, object]:
+    """The request metadata bucket the router writes retry state into (``metadata`` or ``litellm_metadata``)."""
+    if litellm_params is None:
+        return _EMPTY_LIFT
+    for metadata_key in ("metadata", "litellm_metadata"):
+        metadata = litellm_params.get(metadata_key)
+        if isinstance(metadata, dict):
+            return cast("Mapping[str, object]", metadata)  # cast-ok: untyped router dict, keys read with .get
+    return _EMPTY_LIFT
+
+
 def _retry_attempt_records(litellm_params: Mapping[str, object] | None) -> tuple[Mapping[str, object], ...]:
     """The router's ``RetryAttemptRecord`` breadcrumbs, one per failed attempt before the final one."""
     if litellm_params is None:
@@ -1103,10 +1114,13 @@ def _billed_earlier_attempts(
     estimated_usage: Usage,
 ) -> tuple[BilledFailedAttempt, ...]:
     """Every earlier retry attempt the provider also billed. The router records one
-    ``RetryAttemptRecord`` per failed attempt in ``metadata.previous_models``; an attempt that
-    ended in a ``Timeout`` had the same prompt accepted by its deployment, so it is billed like
-    the final attempt, at that deployment's input rate. Only the exception class survives on the
-    record, so an earlier connect timeout is billed too; any other failure class is not."""
+    ``RetryAttemptRecord`` per failed attempt in ``metadata.previous_models``, the final attempt
+    included (its ``attempted_retries`` equals the request's), which the failure row itself
+    bills. An earlier attempt that ended in a ``Timeout`` had the same prompt accepted by its
+    deployment, so it is billed like the final attempt, at that deployment's input rate. Only
+    the exception class survives on the record, so an earlier connect timeout is billed too;
+    any other failure class is not."""
+    final_attempt: Final = _retry_metadata_bucket(litellm_params).get("attempted_retries")
     return tuple(
         BilledFailedAttempt(
             attempted_retries=(
@@ -1119,7 +1133,7 @@ def _billed_earlier_attempts(
             ),
         )
         for index, record in enumerate(_retry_attempt_records(litellm_params))
-        if record.get("exception_type") == litellm.Timeout.__name__
+        if record.get("exception_type") == litellm.Timeout.__name__ and record.get("attempted_retries") != final_attempt
     )
 
 

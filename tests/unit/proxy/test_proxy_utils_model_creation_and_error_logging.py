@@ -2052,8 +2052,9 @@ def test_a_timed_out_request_is_priced_at_the_rate_the_router_registered_for_the
 
 
 def test_every_earlier_timed_out_attempt_is_billed_at_its_own_deployment_rate(monkeypatch):
-    """The router leaves one RetryAttemptRecord per failed attempt in metadata.previous_models; the
-    Timeout ones are billed (each at the deployment that served it), a 429 attempt is not."""
+    """The router leaves one RetryAttemptRecord per failed attempt in metadata.previous_models, the
+    final attempt included; the earlier Timeout ones are billed (each at the deployment that served
+    it), a 429 attempt is not, and the final attempt is left to the failure row itself."""
     from litellm.proxy.utils import _billed_earlier_attempts
 
     monkeypatch.setitem(
@@ -2068,11 +2069,13 @@ def test_every_earlier_timed_out_attempt_is_billed_at_its_own_deployment_rate(mo
         model_call_details={"model": FAILURE_USAGE_MODEL, "custom_llm_provider": "openai"},
         litellm_params={
             "metadata": {
+                "attempted_retries": 3,
                 "previous_models": (
                     {"deployment_id": "dep-lit145-a", "exception_type": "Timeout", "attempted_retries": 0},
                     {"deployment_id": "dep-lit145-b", "exception_type": "RateLimitError", "attempted_retries": 1},
                     {"deployment_id": "dep-lit145-b", "exception_type": "Timeout", "attempted_retries": 2},
-                )
+                    {"deployment_id": "dep-lit145-a", "exception_type": "Timeout", "attempted_retries": 3},
+                ),
             }
         },
         estimated_usage=usage,
