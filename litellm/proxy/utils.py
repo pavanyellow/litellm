@@ -1079,15 +1079,24 @@ class BilledFailedAttempt:
     response_cost: float
 
 
+_NO_RETRY_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
+
+
 def _retry_metadata_bucket(litellm_params: Mapping[str, object] | None) -> Mapping[str, object]:
     """The request metadata bucket the router writes retry state into (``metadata`` or ``litellm_metadata``)."""
     if litellm_params is None:
-        return _EMPTY_LIFT
+        return _NO_RETRY_METADATA
     for metadata_key in ("metadata", "litellm_metadata"):
         metadata = litellm_params.get(metadata_key)
         if isinstance(metadata, dict):
             return cast("Mapping[str, object]", metadata)  # cast-ok: untyped router dict, keys read with .get
-    return _EMPTY_LIFT
+    return _NO_RETRY_METADATA
+
+
+def _attempt_number(record: Mapping[str, object], index: int) -> int:
+    """The attempt a retry record describes: its own ``attempted_retries`` count, else its position."""
+    recorded: Final = record.get("attempted_retries")
+    return recorded if isinstance(recorded, int) else index
 
 
 def _retry_attempt_records(litellm_params: Mapping[str, object] | None) -> tuple[Mapping[str, object], ...]:
@@ -1123,9 +1132,7 @@ def _billed_earlier_attempts(
     final_attempt: Final = _retry_metadata_bucket(litellm_params).get("attempted_retries")
     return tuple(
         BilledFailedAttempt(
-            attempted_retries=(
-                record["attempted_retries"] if isinstance(record.get("attempted_retries"), int) else index
-            ),
+            attempted_retries=_attempt_number(record, index),
             deployment_id=str(record["deployment_id"]) if record.get("deployment_id") is not None else None,
             usage=estimated_usage,
             response_cost=_estimated_input_cost(
