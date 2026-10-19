@@ -157,11 +157,7 @@ from litellm.litellm_core_utils.core_helpers import (
 )
 from litellm.litellm_core_utils.duration_parser import get_budget_window_start
 from litellm.litellm_core_utils.env_utils import get_env_float, get_env_int
-from litellm.litellm_core_utils.litellm_logging import (
-    Logging,
-    deployment_model_info,
-    deployment_pricing_model_info,
-)
+from litellm.litellm_core_utils.litellm_logging import Logging, deployment_pricing_model_info
 from litellm.litellm_core_utils.safe_json_dumps import safe_dumps
 from litellm.litellm_core_utils.safe_json_loads import safe_json_loads
 from litellm.litellm_core_utils.served_output_texts import (
@@ -1065,8 +1061,28 @@ def _failure_usage_to_lift(
     if not provider_billed:
         return estimated_usage, 0.0
     return estimated_usage, _estimated_input_cost(
-        model_call_details, estimated_usage.prompt_tokens, deployment_model_info(litellm_params).get("id")
+        model_call_details, estimated_usage.prompt_tokens, _router_deployment_id(litellm_params)
     )
+
+
+def _router_deployment_id(litellm_params: Mapping[str, object] | None) -> object:
+    """The deployment id the router stamped on the request, resolved the way the success path's
+    ``Logging.get_router_model_id`` does: ``litellm_metadata`` before ``metadata`` (the router writes
+    the real id into ``litellm_metadata`` on /messages and /responses), and only a ``model_info``
+    that carries an ``id`` counts, so a client-supplied ``metadata.model_info`` cannot win."""
+    if litellm_params is None:
+        return None
+    for metadata_key in ("litellm_metadata", "metadata"):
+        metadata = litellm_params.get(metadata_key)
+        if not isinstance(metadata, dict):
+            continue
+        model_info = cast("Mapping[str, object]", metadata).get("model_info")  # cast-ok: untyped router dict
+        if not isinstance(model_info, dict):
+            continue
+        model_id = cast("Mapping[str, object]", model_info).get("id")  # cast-ok: untyped router dict
+        if model_id is not None:
+            return model_id
+    return None
 
 
 @dataclass(frozen=True)
@@ -1083,10 +1099,11 @@ _NO_RETRY_METADATA: Final[Mapping[str, object]] = MappingProxyType({})
 
 
 def _retry_metadata_bucket(litellm_params: Mapping[str, object] | None) -> Mapping[str, object]:
-    """The request metadata bucket the router writes retry state into (``metadata`` or ``litellm_metadata``)."""
+    """The request metadata bucket the router writes retry state into, ``litellm_metadata`` when the
+    route carries one (/messages, /responses) and ``metadata`` otherwise, same order as the deployment id."""
     if litellm_params is None:
         return _NO_RETRY_METADATA
-    for metadata_key in ("metadata", "litellm_metadata"):
+    for metadata_key in ("litellm_metadata", "metadata"):
         metadata = litellm_params.get(metadata_key)
         if isinstance(metadata, dict):
             return cast("Mapping[str, object]", metadata)  # cast-ok: untyped router dict, keys read with .get
@@ -1100,10 +1117,10 @@ def _attempt_number(record: Mapping[str, object], index: int) -> int:
 
 
 def _retry_attempt_records(litellm_params: Mapping[str, object] | None) -> tuple[Mapping[str, object], ...]:
-    """The router's ``RetryAttemptRecord`` breadcrumbs, one per failed attempt before the final one."""
+    """The router's ``RetryAttemptRecord`` breadcrumbs, one per failed attempt, read from the same bucket."""
     if litellm_params is None:
         return ()
-    for metadata_key in ("metadata", "litellm_metadata"):
+    for metadata_key in ("litellm_metadata", "metadata"):
         metadata = litellm_params.get(metadata_key)
         if not isinstance(metadata, dict):
             continue
